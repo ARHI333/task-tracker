@@ -550,7 +550,10 @@ func createUserTable() {
 
 // ---------- Главная функция ----------
 func main() {
-	connStr := "postgres://postgres:secret@localhost:5432/postgres"
+	connStr := os.Getenv("DATABASE_URL")
+	if connStr == "" {
+		connStr = "postgres://postgres:secret@localhost:5432/postgres"
+	}
 	pool, err := pgxpool.New(context.Background(), connStr)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "Не удалось подключиться к базе: %v\n", err)
