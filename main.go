@@ -547,6 +547,10 @@ func createUserTable() {
 	}
 	fmt.Println("Таблица users готова")
 }
+func healthHandler(w http.ResponseWriter, r *http.Request) {
+	w.WriteHeader(http.StatusOK)
+	w.Write([]byte("OK"))
+}
 
 // ---------- Главная функция ----------
 func main() {
@@ -561,14 +565,23 @@ func main() {
 	}
 	defer pool.Close()
 	dbPool = pool
-
-	createTable()
-	createUserTable()
+	// Ждём, пока база данных будет готова принимать запросы
+	for {
+		err := dbPool.Ping(context.Background())
+		if err == nil {
+			break
+		}
+		log.Println("Ожидание готовности базы данных...")
+		time.Sleep(2 * time.Second)
+	}
+	createUserTable() // сначала users, потому что tasks ссылается на users
+	createTable()     // потом tasks
 
 	http.HandleFunc("/tasks", loggingMiddleware(authMiddleware(tasksHandler)))
 	http.HandleFunc("/tasks/", loggingMiddleware(authMiddleware(taskByIDHandler)))
 	http.HandleFunc("/register", loggingMiddleware(registerHandler))
 	http.HandleFunc("/login", loggingMiddleware(loginHandler))
+	http.HandleFunc("/health", healthHandler)
 
 	fmt.Println("Task Tracker запущен на http://localhost:8080")
 	http.ListenAndServe(":8080", nil)
