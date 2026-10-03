@@ -10,6 +10,9 @@ import (
 	"os"
 	"strconv"
 	"strings"
+	"task-tracker/internal/repository"
+	repo "task-tracker/internal/repository"
+	"task-tracker/internal/service"
 	"time"
 
 	"github.com/golang-jwt/jwt/v5"
@@ -19,6 +22,8 @@ import (
 
 // ---------- JWT и контекст ----------
 var jwtSecret = []byte("my-secret-key")
+var taskRepo repository.TaskRepo // глобальная переменная
+var taskService service.TaskService
 
 type contextKey string
 
@@ -30,27 +35,12 @@ type Credentials struct {
 	Password string `json:"password"`
 }
 
-type Task struct {
-	ID          int       `json:"id"`
-	Title       string    `json:"title"`
-	Description string    `json:"description"`
-	Status      string    `json:"status"`
-	CreatedAt   time.Time `json:"created_at"`
-}
-
-// PatchTaskInput — для частичного обновления задачи (PATCH)
-type PatchTaskInput struct {
-	Title       *string `json:"title"`
-	Description *string `json:"description"`
-	Status      *string `json:"status"`
-}
-
 // TaskListResponse — ответ для GET /tasks с пагинацией
 type TaskListResponse struct {
-	Tasks []Task `json:"tasks"`
-	Total int    `json:"total"`
-	Page  int    `json:"page"`
-	Limit int    `json:"limit"`
+	Tasks []repo.Task `json:"tasks"`
+	Total int         `json:"total"`
+	Page  int         `json:"page"`
+	Limit int         `json:"limit"`
 }
 
 // ---------- Глобальный пул БД ----------
@@ -230,32 +220,26 @@ func createTask(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	var task Task
-	if err := json.Unmarshal(body, &task); err != nil {
+	var input struct {
+		Title       string `json:"title"`
+		Description string `json:"description"`
+		Status      string `json:"status"`
+	}
+	if err := json.Unmarshal(body, &input); err != nil {
 		http.Error(w, "Неверный JSON", http.StatusBadRequest)
 		return
 	}
 
-	if task.Title == "" {
-		http.Error(w, "Поле 'title' обязательно", http.StatusBadRequest)
-		return
-	}
-
 	userID := getUserID(r)
-	var newID int
-	var createdAt time.Time
-	err = dbPool.QueryRow(
-		context.Background(),
-		"INSERT INTO tasks (title, description, status, user_id) VALUES ($1, $2, $3, $4) RETURNING id, created_at",
-		task.Title, task.Description, task.Status, userID,
-	).Scan(&newID, &createdAt)
+	task, err := taskService.Create(context.Background(), userID, input.Title, input.Description, input.Status)
 	if err != nil {
-		http.Error(w, fmt.Sprintf("Ошибка сохранения: %v", err), http.StatusInternalServerError)
+		if err.Error() == "поле title обязательно" {
+			http.Error(w, err.Error(), http.StatusBadRequest)
+		} else {
+			http.Error(w, fmt.Sprintf("Ошибка сохранения: %v", err), http.StatusInternalServerError)
+		}
 		return
 	}
-
-	task.ID = newID
-	task.CreatedAt = createdAt
 
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(http.StatusCreated)
@@ -264,92 +248,16 @@ func createTask(w http.ResponseWriter, r *http.Request) {
 
 func listTasks(w http.ResponseWriter, r *http.Request) {
 	userID := getUserID(r)
+	page, _ := strconv.Atoi(r.URL.Query().Get("page"))
+	limit, _ := strconv.Atoi(r.URL.Query().Get("limit"))
+	search := r.URL.Query().Get("search")
 
-	// ---------- Чтение query-параметров ----------
-	// page и limit — с значениями по умолчанию
-	pageStr := r.URL.Query().Get("page")
-	limitStr := r.URL.Query().Get("limit")
-	search := r.URL.Query().Get("search") // может быть пустым
-
-	page := 1
-	limit := 10 // значение по умолчанию
-
-	if pageStr != "" {
-		var err error
-		page, err = strconv.Atoi(pageStr)
-		if err != nil || page < 1 {
-			http.Error(w, "Параметр 'page' должен быть положительным целым числом", http.StatusBadRequest)
-			return
-		}
-	}
-
-	if limitStr != "" {
-		var err error
-		limit, err = strconv.Atoi(limitStr)
-		if err != nil || limit < 1 || limit > 100 {
-			http.Error(w, "Параметр 'limit' должен быть целым числом от 1 до 100", http.StatusBadRequest)
-			return
-		}
-	}
-
-	offset := (page - 1) * limit
-
-	// ---------- Построение запроса ----------
-	// Базовый запрос с фильтром по пользователю
-	query := `SELECT id, title, description, status, created_at FROM tasks WHERE user_id = $1`
-	countQuery := `SELECT COUNT(*) FROM tasks WHERE user_id = $1`
-
-	// Аргументы для запросов
-	args := []interface{}{userID}
-	countArgs := []interface{}{userID}
-
-	// Добавляем поиск, если задан
-	if search != "" {
-		// ILIKE делает поиск регистронезависимым
-		searchClause := ` AND (title ILIKE '%' || $2 || '%' OR description ILIKE '%' || $2 || '%')`
-		query += searchClause
-		countQuery += searchClause
-		args = append(args, search)
-		countArgs = append(countArgs, search)
-	}
-
-	// Сначала получаем общее количество записей (для пагинации)
-	var total int
-	err := dbPool.QueryRow(context.Background(), countQuery, countArgs...).Scan(&total)
-	if err != nil {
-		http.Error(w, fmt.Sprintf("Ошибка подсчёта задач: %v", err), http.StatusInternalServerError)
-		return
-	}
-
-	// Добавляем сортировку и пагинацию
-	query += ` ORDER BY id ASC LIMIT $` + strconv.Itoa(len(args)+1) + ` OFFSET $` + strconv.Itoa(len(args)+2)
-	args = append(args, limit, offset)
-
-	// Выполняем основной запрос
-	rows, err := dbPool.Query(context.Background(), query, args...)
+	tasks, total, err := taskService.List(context.Background(), userID, page, limit, search)
 	if err != nil {
 		http.Error(w, fmt.Sprintf("Ошибка запроса: %v", err), http.StatusInternalServerError)
 		return
 	}
-	defer rows.Close()
 
-	var tasks []Task
-	for rows.Next() {
-		var t Task
-		err := rows.Scan(&t.ID, &t.Title, &t.Description, &t.Status, &t.CreatedAt)
-		if err != nil {
-			http.Error(w, fmt.Sprintf("Ошибка чтения строки: %v", err), http.StatusInternalServerError)
-			return
-		}
-		tasks = append(tasks, t)
-	}
-
-	// Гарантируем, что tasks не будет nil (для красивого JSON)
-	if tasks == nil {
-		tasks = []Task{}
-	}
-
-	// Формируем ответ
 	resp := TaskListResponse{
 		Tasks: tasks,
 		Total: total,
@@ -378,8 +286,6 @@ func taskByIDHandler(w http.ResponseWriter, r *http.Request) {
 		getTask(w, r, id)
 	case http.MethodPut:
 		updateTask(w, r, id)
-	case http.MethodPatch: // <-- новый метод
-		updateTaskPartial(w, r, id)
 	case http.MethodDelete:
 		deleteTask(w, r, id)
 	default:
@@ -389,20 +295,15 @@ func taskByIDHandler(w http.ResponseWriter, r *http.Request) {
 }
 
 func getTask(w http.ResponseWriter, r *http.Request, id int) {
-	var t Task
-	err := dbPool.QueryRow(
-		context.Background(),
-		"SELECT id, title, description, status, created_at FROM tasks WHERE id = $1 AND user_id = $2",
-		id, getUserID(r),
-	).Scan(&t.ID, &t.Title, &t.Description, &t.Status, &t.CreatedAt)
-
+	userID := getUserID(r)
+	task, err := taskService.GetByID(context.Background(), userID, id)
 	if err != nil {
 		http.Error(w, "Задача не найдена", http.StatusNotFound)
 		return
 	}
 
 	w.Header().Set("Content-Type", "application/json")
-	json.NewEncoder(w).Encode(t)
+	json.NewEncoder(w).Encode(task)
 }
 
 func updateTask(w http.ResponseWriter, r *http.Request, id int) {
@@ -412,94 +313,41 @@ func updateTask(w http.ResponseWriter, r *http.Request, id int) {
 		return
 	}
 
-	var input Task
+	var input struct {
+		Title       string `json:"title"`
+		Description string `json:"description"`
+		Status      string `json:"status"`
+	}
 	if err := json.Unmarshal(body, &input); err != nil {
 		http.Error(w, "Неверный JSON", http.StatusBadRequest)
 		return
 	}
 
-	_, err = dbPool.Exec(
-		context.Background(),
-		"UPDATE tasks SET title = $1, description = $2, status = $3 WHERE id = $4 AND user_id = $5",
-		input.Title, input.Description, input.Status, id, getUserID(r),
-	)
+	userID := getUserID(r)
+	updateInput := repository.UpdateInput{
+		Title:       &input.Title,
+		Description: &input.Description,
+		Status:      &input.Status,
+	}
+	task, err := taskService.Update(context.Background(), userID, id, updateInput)
 	if err != nil {
-		http.Error(w, fmt.Sprintf("Ошибка обновления: %v", err), http.StatusInternalServerError)
+		http.Error(w, "Задача не найдена", http.StatusNotFound)
 		return
 	}
 
-	getTask(w, r, id) // возвращаем обновлённую задачу
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(task)
 }
 
 func deleteTask(w http.ResponseWriter, r *http.Request, id int) {
-	_, err := dbPool.Exec(context.Background(),
-		"DELETE FROM tasks WHERE id = $1 AND user_id = $2",
-		id, getUserID(r),
-	)
-	if err != nil {
-		http.Error(w, fmt.Sprintf("Ошибка удаления: %v", err), http.StatusInternalServerError)
+	userID := getUserID(r)
+	if err := taskService.Delete(context.Background(), userID, id); err != nil {
+		http.Error(w, "Задача не найдена", http.StatusNotFound)
 		return
 	}
-
 	w.WriteHeader(http.StatusNoContent)
 }
 
-// ---------- Инициализация таблиц ----------
-// updateTaskPartial обрабатывает PATCH /tasks/{id}
-func updateTaskPartial(w http.ResponseWriter, r *http.Request, id int) {
-	body, err := io.ReadAll(r.Body)
-	if err != nil {
-		http.Error(w, "Ошибка чтения", http.StatusBadRequest)
-		return
-	}
-
-	var input PatchTaskInput
-	if err := json.Unmarshal(body, &input); err != nil {
-		http.Error(w, "Неверный JSON", http.StatusBadRequest)
-		return
-	}
-
-	// Проверяем, что хотя бы одно поле передано
-	if input.Title == nil && input.Description == nil && input.Status == nil {
-		http.Error(w, "Нет полей для обновления", http.StatusBadRequest)
-		return
-	}
-
-	// Динамически строим SQL
-	setClauses := []string{}
-	args := []interface{}{} // аргументы для SQL
-	argPos := 1             // счётчик позиций $1, $2...
-
-	if input.Title != nil {
-		setClauses = append(setClauses, fmt.Sprintf("title = $%d", argPos))
-		args = append(args, *input.Title)
-		argPos++
-	}
-	if input.Description != nil {
-		setClauses = append(setClauses, fmt.Sprintf("description = $%d", argPos))
-		args = append(args, *input.Description)
-		argPos++
-	}
-	if input.Status != nil {
-		setClauses = append(setClauses, fmt.Sprintf("status = $%d", argPos))
-		args = append(args, *input.Status)
-		argPos++
-	}
-
-	// Собираем запрос: UPDATE tasks SET ... WHERE id = $N AND user_id = $M
-	query := "UPDATE tasks SET " + strings.Join(setClauses, ", ") +
-		fmt.Sprintf(" WHERE id = $%d AND user_id = $%d", argPos, argPos+1)
-	args = append(args, id, getUserID(r))
-
-	_, err = dbPool.Exec(context.Background(), query, args...)
-	if err != nil {
-		http.Error(w, fmt.Sprintf("Ошибка обновления: %v", err), http.StatusInternalServerError)
-		return
-	}
-
-	// Возвращаем обновлённую задачу
-	getTask(w, r, id)
-}
 func createTable() {
 	_, err := dbPool.Exec(context.Background(), "DROP TABLE IF EXISTS tasks CASCADE")
 	if err != nil {
@@ -574,9 +422,11 @@ func main() {
 		log.Println("Ожидание готовности базы данных...")
 		time.Sleep(2 * time.Second)
 	}
+
 	createUserTable() // сначала users, потому что tasks ссылается на users
 	createTable()     // потом tasks
-
+	taskRepo = repository.NewPostgresTaskRepo(pool)
+	taskService = service.NewTaskService(taskRepo)
 	http.HandleFunc("/tasks", loggingMiddleware(authMiddleware(tasksHandler)))
 	http.HandleFunc("/tasks/", loggingMiddleware(authMiddleware(taskByIDHandler)))
 	http.HandleFunc("/register", loggingMiddleware(registerHandler))
@@ -585,4 +435,5 @@ func main() {
 
 	fmt.Println("Task Tracker запущен на http://localhost:8080")
 	http.ListenAndServe(":8080", nil)
+
 }
